@@ -111,7 +111,12 @@ jobs:
           #   · 升级：update.py 把它同步进上游目录（保留 config/auths/data）
           # 取不到**不致命**（网络抖动、载体未建）：记一条醒目日志继续打包，
           # 用户仍可用 UPSTREAM_SRC 自己指定源码。
-          UPSTREAM_SRC_URL="${UPSTREAM_SRC_URL:-https://github.com/${{ github.repository }}/releases/download/upstream-src/workbuddy2api-src.tar.gz}"
+          # The original workbuddy2api repository was deleted.  Keep the
+          # bundled source aligned with the maintained fork instead of the
+          # manager repository's historical upstream snapshot.  An explicit
+          # UPSTREAM_SRC_URL still overrides this for reproducible/offline
+          # release jobs.
+          UPSTREAM_SRC_URL="${UPSTREAM_SRC_URL:-https://github.com/uxiner/workbuddy2api-panel/archive/refs/heads/main.tar.gz}"
           mkdir -p "$STAGE/upstream"
           if curl -fsSL --retry 3 --retry-delay 2 --max-time 120 \
                  "$UPSTREAM_SRC_URL" -o /tmp/upstream-src.tar.gz \

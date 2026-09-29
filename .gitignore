@@ -97,6 +97,8 @@ dev/.shots-keys-layout
 # 账号备注验收（verify_account_note_ui.py）的临时数据与截图
 dev/.account-note
 dev/.shots-account-note
+# 账号分组验收（verify_account_groups_ui.py）的临时数据（截图随 PR 提交，不忽略）
+dev/.account-groups
 # 提示词缓存标记验收（verify_cache_log_ui.py）的临时数据与截图
 dev/.cache-log
 dev/.shots-cache-log
@@ -107,3 +109,17 @@ dev/.pack-test
 # 红包抽奖页验收（verify_claim_ui.py）的临时数据与截图
 dev/.claim-ui
 dev/.shots-claim-ui
+# DeviceTokenTest 的临时文件现场（test_outbound_alignment.py，只清文件、目录保留）
+server/tests/_dt_tmp/
+
+# ── 本机部署产物（严禁提交：含账号授权凭据与体积庞大的工具链）─────
+# upstream/ 内有 auths/（真实 CodeBuddy 账号授权）与 config.json（含 api_key）；
+# .tools/ 是本地 Go 工具链（数百 MB）；local-ops/ 是单机启停脚本。
+# 只锚定**仓库根目录**那份上游源码；不锚定的话这条会连带吞掉任何同名子目录
+# （web/app/(main)/settings/upstream/ 就这么丢过 —— 文件提交不进去，本地测试照样绿）。
+/upstream/
+.tools/
+local-ops/
+LOCAL_DEPLOY_NOTES.md
+start-all.cmd
+stop-all.cmd

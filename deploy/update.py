@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import http.client
 import os
 import re
 import shutil
@@ -34,13 +35,78 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+
+def _force_utf8_stdio() -> None:
+    """中文 Windows 上重定向 stdout/stderr 默认 cp936（GBK）：print('✓'/'⚠️')
+    会 UnicodeEncodeError 直接杀死更新进程（时间戳前缀 11 字符 + ✓ 正是
+    'position 11' 报错的来源）。无论由谁启动、stdout 重定向到哪，这里
+    自我防御：stdio 强制 UTF-8，个别无法编码的字符以 replace 兜底，
+    日志绝不因此中断。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+_force_utf8_stdio()
+
+
 # ── 运行环境（与 server/config.py 保持一致的默认值）──────────
 INSTALL_DIR = Path(os.environ.get('WB_INSTALL_DIR') or Path(__file__).resolve().parent.parent)
 UPSTREAM_DIR = Path(os.environ.get('WB_UPSTREAM_DIR') or '/opt/workbuddy2api')
 UPSTREAM_PORT = int(os.environ.get('WB_UPSTREAM_PORT') or 7863)
 MANAGER_PORT = int(os.environ.get('WB_MANAGER_PORT') or 7864)
 MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
-UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/Sliverkiss/workbuddy2api.git'
+
+# ── 下载代理（issue #106）──────────────────────────────────────
+# 容器里能连上 api.github.com（版本检测走它）却连不上 Release 资产所在的
+# github.com / objects.githubusercontent.com 是常见情形——两条链路可达性不同。
+# 版本检测成功会把「下载不可达」掩盖成「更新器坏了」，所以这里给一个明确的旋钮。
+# 取值顺序：WB_UPDATE_PROXY（更新专用）> WB_HTTP_PROXY（面板的出口代理，
+# 用户已经为它配过代理时不必再配一遍）> 环境变量里的 http_proxy / https_proxy
+# （urllib 的默认行为）。本机地址由 no_proxy 自动放行。
+UPDATE_PROXY = (os.environ.get('WB_UPDATE_PROXY')
+                or os.environ.get('WB_HTTP_PROXY') or '').strip()
+if UPDATE_PROXY:
+    # 本机与内网不走代理：更新器要读本地状态文件，代理配置不该把内网也带偏。
+    os.environ.setdefault('no_proxy', '127.0.0.1,localhost')
+    os.environ.setdefault('NO_PROXY', os.environ['no_proxy'])
+
+
+def _opener() -> urllib.request.OpenerDirector:
+    """按配置构造 opener：设了 WB_UPDATE_PROXY 就用它，否则用环境变量默认。"""
+    handlers: list[urllib.request.BaseHandler] = []
+    if UPDATE_PROXY:
+        handlers.append(urllib.request.ProxyHandler(
+            {'http': UPDATE_PROXY, 'https': UPDATE_PROXY}))
+    handlers.append(urllib.request.HTTPSHandler())
+    return urllib.request.build_opener(*handlers)
+
+
+def _download_hint(exc: BaseException) -> str:
+    """下载失败的**可操作**提示：区分「网络到不了 GitHub」与其它原因。"""
+    text = str(exc)
+    looks_like_network = any(k in text for k in (
+        'timed out', 'Timeout', 'Remote end closed', 'Connection reset',
+        'No address associated', 'Temporary failure', 'Name or service',
+        'Connection refused', 'unreachable',
+    ))
+    if not looks_like_network:
+        return ''
+    if UPDATE_PROXY:
+        return (f'（已配置代理 {UPDATE_PROXY}，仍连不上 —— 检查代理地址是否可从本机访问、'
+                f'以及它是否放行 github.com）')
+    if urllib.request.getproxies():
+        return '（当前使用的是环境变量里的代理；若代理不可用，可用 WB_UPDATE_PROXY 指定一个）'
+    return ('（当前网络似乎无法直连 GitHub。容器/内网环境请在 .env 里设置 '
+            'WB_UPDATE_PROXY=http://<宿主IP>:<端口> 后重试，例如 http://172.17.0.1:7890）')
+UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/uxiner/workbuddy2api-panel.git'
+# External-image deployments manage workbuddy2api separately.  In that mode
+# manager updates must not copy bundled source into the production bind mount
+# or rebuild the upstream container.  Existing source-style deployments keep
+# the historical bundled behavior by default.
+UPSTREAM_MODE = (os.environ.get('WB_UPSTREAM_MODE') or 'bundled').strip().lower()
 SERVICE_NAME = os.environ.get('WB_SERVICE_NAME') or 'workbuddy-web'
 DATA_DIR = Path(os.environ.get('WB_DATA_DIR') or INSTALL_DIR / 'data')
 STATUS_FILE = Path(os.environ.get('WB_UPDATE_STATUS') or DATA_DIR / 'update-status.json')
@@ -184,15 +250,44 @@ def http_json(url: str, timeout: int = 20) -> dict:
         'Accept': 'application/vnd.github+json',
         'User-Agent': 'workbuddy-manager-updater',
     })
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _opener().open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 
 def download(url: str, dest: Path, rep: Reporter) -> None:
+    """下载 Release 资产到 dest。
+
+    timeout=120 是**单次 socket 操作**的超时（只在无数据流动时计时），不是
+    总时长——代理/TUN 链路慢时全量下载远超 120 秒属正常，不会被它中断。
+    对偶发网络失败（连接重置、响应中断、5xx）自动重试一次：更新是低频操作，
+    多花一次下载的代价远小于整次更新失败；4xx 是请求本身的问题（版本不存在、
+    地址错），重试不会变好，直接抛出。
+    """
     rep.log(f'下载 {url}')
-    req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, 'wb') as fh:
-        shutil.copyfileobj(resp, fh)
+    last: BaseException | None = None
+    for attempt in (1, 2):
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'workbuddy-manager-updater'})
+            with _opener().open(req, timeout=120) as resp, open(dest, 'wb') as fh:
+                shutil.copyfileobj(resp, fh)
+            last = None
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                raise
+            last = exc
+        except (OSError, http.client.HTTPException) as exc:
+            # URLError/socket.timeout/ConnectionReset 等都是 OSError 子类；
+            # IncompleteRead 走 HTTPException。两类都值得再试一次。
+            last = exc
+        if attempt == 1:
+            rep.log(f'下载失败（{last}），自动重试一次…', 'warn')
+    if last is not None:
+        # 只有「看着像网络到不了 GitHub」的失败才补一句可操作提示；其余照原样抛出，
+        # 保持调用方与既有测试看到的异常类型不变。
+        hint = _download_hint(last)
+        raise RuntimeError(f'{last} {hint}') if hint else last
+
     size = dest.stat().st_size
     rep.log(f'  完成（{size / 1024 / 1024:.2f} MB）')
     if size < 100_000:
@@ -275,7 +370,7 @@ def download_signature(sig_url: str, archive: Path, rep: Reporter) -> Path:
     rep.log('下载签名文件…')
     try:
         req = urllib.request.Request(sig_url, headers={'User-Agent': 'workbuddy-manager-updater'})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
+        with _opener().open(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
             shutil.copyfileobj(resp, fh)
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(
@@ -1102,14 +1197,17 @@ def update_manager(rep: Reporter) -> None:
         # 由此落在签名信任链内；另下一份则没有这层保证。
         # 只有真的改动了才重建容器——上游源码在两版之间多数没变，白重建一次要等
         # 好几分钟，还会把上游短暂停掉。
-        changed = _sync_bundled_upstream(new_root / 'upstream', rep)
-        if changed:
-            # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），而端口收敛
-            # 是在 update_upstream 里做的——那一步在本函数之前。同步会把它盖掉，
-            # 所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
-            enforce_local_bind(rep)
-            rep.log('上游源码有变化，重建容器使其生效…')
-            rebuild_upstream(rep)
+        if UPSTREAM_MODE in ('external', 'off', 'disabled', 'none'):
+            rep.log('已配置 WB_UPSTREAM_MODE=external：跳过内置 upstream 同步与重建')
+        else:
+            changed = _sync_bundled_upstream(new_root / 'upstream', rep)
+            if changed:
+                # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），而端口收敛
+                # 是在 update_upstream 里做的——那一步在本函数之前。同步会把它盖掉，
+                # 所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。
+                enforce_local_bind(rep)
+                rep.log('上游源码有变化，重建容器使其生效…')
+                rebuild_upstream(rep)
 
     # 4) 依赖有变化则重装
     req = INSTALL_DIR / 'server' / 'requirements.txt'
@@ -1179,6 +1277,13 @@ def restart_service(rep: Reporter) -> None:
         rep.log('（容器无法自我重启；compose 的 restart 策略会在进程退出后')
         rep.log('  用新代码重新启动。若长时间未恢复，请在宿主机执行：')
         rep.log('  docker compose restart workbuddy-manager）')
+        return
+    if os.name == 'nt':
+        # Windows 原生部署（deploy/windows-native）：没有 systemd，也不该在这里
+        # 报一次「systemctl 重启失败」——那时新代码其实已经就位，用户看到的却是一次
+        # 失败的更新（还可能去查一个 Windows 上根本不存在的服务）。如实说明怎么做。
+        rep.log('Windows 原生部署：新代码已就位。请关闭当前面板窗口，'
+                '重新执行启动脚本（start-workbuddy-manager.cmd）。')
         return
     rc, _ = run(['systemctl', 'restart', SERVICE_NAME], rep=rep, check=False)
     if rc != 0:
@@ -1291,9 +1396,22 @@ def main() -> int:
             update_upstream(rep)
         if args.target in ('manager', 'both'):
             update_manager(rep)
-    except Exception as exc:  # noqa: BLE001
-        rep.log(f'更新失败：{exc}', 'error')
+    except BaseException as exc:  # noqa: BLE001
+        # KeyboardInterrupt（控制台 Ctrl+C/关窗）、SystemExit 等 BaseException
+        # 也要捕获并留下终态：只捕 Exception 的话中断会直接穿出去，
+        # 状态文件永远停在 running=true，前端就永远等不到「更新未完成」的
+        # 结束信号，一直显示「正在更新：执行中」。
+        if isinstance(exc, KeyboardInterrupt):
+            rep.log('更新被中断（收到 Ctrl+C / 控制台关闭信号）', 'error')
+        else:
+            rep.log(f'更新失败：{exc}', 'error')
         ok = False
+    finally:
+        # 收尾兜底：任何退出路径都必须把终态落盘。正常成功路径已在
+        # update_manager 内 rep.finish(True) 写过（running=false），这里
+        # 幂等跳过；其余情形（含中断）在此补写 ok=false，绝不留悬空状态。
+        if rep.state.get('running'):
+            rep.finish(ok)
 
     rep.log('更新完成' if ok else '更新未完成，请检查上方日志')
     rep.finish(ok)

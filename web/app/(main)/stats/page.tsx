@@ -1,10 +1,12 @@
 'use client';
 
-import {useCallback, useEffect, useState} from 'react';
+import {useCallback, useState} from 'react';
 import {Activity, TrendingUp, KeyRound, Cpu, Wrench, RotateCcw, Coins, AlertTriangle, Server} from 'lucide-react';
 import {
+  Area,
   Bar,
   CartesianGrid,
+  Cell,
   ComposedChart,
   Line,
   ResponsiveContainer,
@@ -13,13 +15,29 @@ import {
   YAxis,
 } from 'recharts';
 import {useHeartbeat} from '@/lib/use-heartbeat';
+import {useAsyncAll} from '@/lib/use-async-data';
 import {statsApi, errText} from '@/lib/api';
-import type {StatsSummary, UpstreamStats, UsageBreakdown, UsagePoint} from '@/lib/types';
+import type {
+  StatsSummary,
+  UpstreamStats,
+  UsageBreakdown,
+  UsagePoint,
+  UsageHourPoint,
+} from '@/lib/types';
+import {
+  chartSpecFor,
+  dailySeries,
+  hourlySeries,
+  todayKeyLocal,
+  type ChartPoint,
+} from '@/lib/usage-chart';
 import {fmtCompact, fmtNumber, fmtCredit} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {StatCard} from '@/components/common/layout/StatCard';
 import {EmptyState} from '@/components/common/layout/EmptyState';
 import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
+import {LoadError} from '@/components/common/states/LoadError';
+import {SkeletonBar} from '@/components/common/states/SkeletonBar';
 import {useAuth} from '@/lib/auth-context';
 import {useRealm} from '@/lib/realm-context';
 import {Button} from '@/components/ui/button';
@@ -50,6 +68,17 @@ const CHART_COLORS = [
 ];
 
 /**
+ * 空数组的稳定引用。
+ *
+ * 必须是模块级常量，不能每次渲染现写一个 `[]`：它们是「还没取到」时的兜底值，
+ * 每帧新建的数组会让下游任何依赖它的 `useMemo` / `useEffect` 每帧重算
+ * （这里就有：`chartData` 与两张分解表的 `max` 都从它们派生）。
+ */
+const EMPTY_POINTS: UsagePoint[] = [];
+const EMPTY_HOURS: UsageHourPoint[] = [];
+const EMPTY_BREAKDOWN: UsageBreakdown[] = [];
+
+/**
  * 统计健康提示的详情本地化。
  *
  * 服务端（`server/routers/stats.py` 的 `_usage_health`）同时返回**结构化数字**
@@ -78,10 +107,6 @@ export default function StatsPage() {
   // 统计随顶部版本切换：两个版本走的是不同账号池，混在一起看没有意义
   const {realm, label: realmName} = useRealm();
   const t = useT();
-  const [summary, setSummary] = useState<StatsSummary | null>(null);
-  const [daily, setDaily] = useState<UsagePoint[]>([]);
-  const [byModel, setByModel] = useState<UsageBreakdown[]>([]);
-  const [byKey, setByKey] = useState<UsageBreakdown[]>([]);
   /**
    * 时段。默认「今日」（issue #53）。
    *
@@ -94,143 +119,217 @@ export default function StatsPage() {
    * 见 `server/routers/stats.py` 的 `_since`），所以趋势图、按模型、按密钥三处
    * 与选择器天然同一口径，不需要各自翻译一遍。
    */
-  /**
-   * 上游自己那份统计（issue #59）。
-   *
-   * 单独取、单独摆：它**不跟时段与版本走**（是上游进程自启动以来的累计，且含
-   * 直连上游的调用），跟本页其它数字混在一起会让人以为「今日请求」包含了直连流量。
-   * 取不到时**不弹提示**——上游没起来、镜像太旧都会取不到，那是常态，就地写清原因
-   * 就够了；每次刷新弹一个错误反而吵。
-   */
-  const [upstream, setUpstream] = useState<UpstreamStats | null>(null);
   const [days, setDays] = useState('1');
-  const load = useCallback(async () => {
-    const d = Number(days) || 1;
-    const results = await Promise.allSettled([
-      statsApi.summary(realm),
-      statsApi.daily(d, realm),
-      statsApi.byModel(d, realm),
-      statsApi.byKey(d, realm),
-    ]);
-    if (results[0].status === 'fulfilled') setSummary(results[0].value);
-    if (results[1].status === 'fulfilled') setDaily(results[1].value);
-    if (results[2].status === 'fulfilled') setByModel(results[2].value);
-    if (results[3].status === 'fulfilled') setByKey(results[3].value);
-    if (results.some((r) => r.status === 'rejected')) notify.err(errText((results.find((r) => r.status === 'rejected') as PromiseRejectedResult).reason));
-    // 上游统计单独拉，**不进 allSettled**：它失败不该弹提示（见上面说明）
-    try {
-      setUpstream(await statsApi.upstream());
-    } catch {
-      setUpstream({available: false});
-    }
-  }, [days, realm, t]);
+  const d = Number(days) || 1;
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  /**
+   * 本页四份统计。
+   *
+   * `realm` 与 `days` 都算**数据上下文**（而不是「查询范围」）：改了时段，四张卡片
+   * 与两张分解表的含义整体变了，旧数字留在屏幕上就成了「选择器写着今日、数字其实
+   * 是近 30 天」——所以清空重取，宁可闪一下骨架。
+   */
+  const {
+    values,
+    errors,
+    isInitialLoading,
+    isInitialFailed,
+    isRefreshing,
+    reload,
+  } = useAsyncAll(
+    {
+      summary: () => statsApi.summary(realm),
+      daily: () => statsApi.daily(d, realm),
+      // 「今日」的图按小时画（见 lib/usage-chart.ts 的说明）：只有这个范围需要
+      // 小时数据，其它范围直接给空数组，省一次请求。
+      hourly: () => (days === '1' ? statsApi.hourly(undefined, realm)
+                                  : Promise.resolve([] as UsageHourPoint[])),
+      byModel: () => statsApi.byModel(d, realm),
+      byKey: () => statsApi.byKey(d, realm),
+    },
+    [realm, days],
+  );
+
+  /**
+   * 上游自己那份统计（issue #59），**单独一个 hook**。改动前它也是单独拉的
+   * （在原代码里不进 `allSettled`），拆开是恢复那个结构，理由有两条：
+   *
+   *  · 它失败时**故意退化成 `{available: false}` 而不是抛错**，好让面板就地写清
+   *    原因、不弹提示（上游没起来、镜像太旧都会取不到，那是常态）。可这样一来它
+   *    就成了一次「成功的取数」——若和上面那组放在一起，五份全挂时它照样有值，
+   *    「一份都没取到」的判据就被顶掉了：页面不进整页错误态，反而照常渲染四张 0
+   *    卡片和「暂无数据」，正是本批要修的那句谎话。
+   *  · 它本来就不属于 `errors` 的语义范围——上面那条「部分数据加载失败」是给本页
+   *    四份数据用的，上游取不到不该算进去。
+   *
+   * 依赖用 `refreshDeps` 而不是 `deps`：时段 / 版本变了要跟着重取（改动前就是
+   * 这样），但**不清空**——它跟时段无关，清空只会让面板闪一下「上游统计暂不可用」。
+   */
+  const {values: upstreamValues, reload: reloadUpstream} = useAsyncAll(
+    {
+      upstream: async () => {
+        try {
+          return await statsApi.upstream();
+        } catch {
+          return {available: false} as UpstreamStats;
+        }
+      },
+    },
+    [],
+    [realm, days],
+  );
+
+  const summary: StatsSummary | null = values.summary ?? null;
+  const daily: UsagePoint[] = values.daily ?? EMPTY_POINTS;
+  const byModel: UsageBreakdown[] = values.byModel ?? EMPTY_BREAKDOWN;
+  const byKey: UsageBreakdown[] = values.byKey ?? EMPTY_BREAKDOWN;
+  const upstream: UpstreamStats | null = upstreamValues.upstream ?? null;
+
+  const failedCount = Object.keys(errors).length;
+
+  /** 重试：两组一起重来，避免「点了重试、上游面板还是旧的」 */
+  const retry = useCallback(() => {
+    reload();
+    reloadUpstream();
+  }, [reload, reloadUpstream]);
 
   // 用量随调用持续累计，心跳刷新让页面保持接近实时
-  useHeartbeat(load, 60000);
+  useHeartbeat(retry, 60000);
 
-  const chartData = daily.map((d) => ({
-    day: d.day.slice(5),
-    tokens: d.prompt_tokens + d.completion_tokens,
-    requests: d.requests,
-    // 失败曲线来自另一份数据源（请求日志），与用量汇总不构成堆叠关系
-    failed: d.failed ?? 0,
-  }));
+  const spec = chartSpecFor(d);
+  const hourly: UsageHourPoint[] = values.hourly ?? EMPTY_HOURS;
+  /**
+   * 趋势图的点。**粒度跟着范围走**（粒度/形态的判据在 lib/usage-chart.ts）：
+   *  · 今日 → 24 个小时桶（后端已补零；这里只做标签与「当前小时」标记）；
+   *  · 多日 → 按天并补齐到窗口长度（缺的那天不再是「凭空消失」而是画成 0）。
+   */
+  const chartData: ChartPoint[] = spec.granularity === 'hour'
+    ? hourlySeries(hourly, new Date().getHours())
+    : dailySeries(daily, d, todayKeyLocal());
 
   /** 今日失败总数（4xx + 5xx）。单独来自请求日志——用量汇总只含成功请求。 */
   const todayFailed =
     (summary?.failures?.today_4xx ?? 0) + (summary?.failures?.today_5xx ?? 0);
 
-  return (
-    <div className="flex flex-col gap-4 md:gap-6">
-      <PageHeader
-        title={t('stats.title')}
-        description={t('stats.description', {realm: realmName})}
-        actions={
-          <>
-            <Select value={days} onValueChange={setDays}>
-              <SelectTrigger className="h-8 w-[130px] rounded-full"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                {/* 「今日」排在第一位并作为默认：与上方卡片的「今日」口径对齐 */}
-                <SelectItem value="1">{t('stats.today')}</SelectItem>
-                <SelectItem value="7">{t('stats.last7')}</SelectItem>
-                <SelectItem value="30">{t('stats.last30')}</SelectItem>
-                <SelectItem value="90">{t('stats.last90')}</SelectItem>
-              </SelectContent>
-            </Select>
-            {isAdmin && (
-              <ConfirmDialog
-                title={t('stats.repairTitle')}
-                description={t('stats.repairDesc')}
-                confirmText={t('stats.repairStart')}
-                onConfirm={async () => {
-                  try {
-                    const r = await statsApi.repairUsage();
-                    if (r.repaired > 0) {
-                      notify.ok(
-                        t('stats.repaired'),
-                        t('stats.repairedDetail', {
-                          requests: fmtNumber(r.requests),
-                          tokens: fmtNumber(r.tokens),
-                        }),
-                      );
-                    } else {
-                      notify.info(t('stats.nothingToRepair'), t('stats.nothingToRepairDesc'));
-                    }
-                    await load();
-                  } catch (e) {
-                    notify.err(errText(e));
-                  }
-                }}
-                trigger={
-                  <Button variant="outline" size="sm" className="rounded-full">
-                    <Wrench className="h-3.5 w-3.5" />
-                    {t('stats.repairButton')}
-                  </Button>
-                }
-              />
-            )}
-            {isAdmin && (
-              <ConfirmDialog
-                title={t('stats.rebuildTitle')}
-                description={t('stats.rebuildDesc')}
-                confirmText={t('stats.rebuildStart')}
-                destructive
-                onConfirm={async () => {
-                  try {
-                    const r = await statsApi.rebuildUsage();
-                    const d = r.tokens_delta;
+  /**
+   * 页头抽成变量，是为了让下面「首屏骨架 / 错误态」那一段也带上它——
+   * 否则加载期间连标题都没有，用户会以为跳错了页面。
+   */
+  const header = (
+    <PageHeader
+      title={t('stats.title')}
+      description={t('stats.description', {realm: realmName})}
+      actions={
+        <>
+          <Select value={days} onValueChange={setDays}>
+            <SelectTrigger className="h-8 w-[130px] rounded-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {/* 「今日」排在第一位并作为默认：与上方卡片的「今日」口径对齐 */}
+              <SelectItem value="1">{t('stats.today')}</SelectItem>
+              <SelectItem value="7">{t('stats.last7')}</SelectItem>
+              <SelectItem value="30">{t('stats.last30')}</SelectItem>
+              <SelectItem value="90">{t('stats.last90')}</SelectItem>
+            </SelectContent>
+          </Select>
+          {isAdmin && (
+            <ConfirmDialog
+              title={t('stats.repairTitle')}
+              description={t('stats.repairDesc')}
+              confirmText={t('stats.repairStart')}
+              onConfirm={async () => {
+                try {
+                  const r = await statsApi.repairUsage();
+                  if (r.repaired > 0) {
                     notify.ok(
-                      t('stats.rebuilt'),
-                      t('stats.rebuiltDetail', {
-                        before: fmtNumber(r.rows_before),
-                        after: fmtNumber(r.rows_after),
-                      }) +
-                        (d !== 0
-                          ? t('stats.rebuiltDetailTokens', {
-                              delta: `${d > 0 ? '+' : ''}${fmtNumber(d)}`,
-                            })
-                          : t('stats.rebuiltDetailSame')),
+                      t('stats.repaired'),
+                      t('stats.repairedDetail', {
+                        requests: fmtNumber(r.requests),
+                        tokens: fmtNumber(r.tokens),
+                      }),
                     );
-                    await load();
-                  } catch (e) {
-                    notify.err(errText(e));
+                  } else {
+                    notify.info(t('stats.nothingToRepair'), t('stats.nothingToRepairDesc'));
                   }
-                }}
-                trigger={
-                  <Button variant="outline" size="sm" className="rounded-full text-amber-600 dark:text-amber-400">
-                    <RotateCcw className="h-3.5 w-3.5" />
-                    {t('stats.rebuildButton')}
-                  </Button>
+                  reload();
+                } catch (e) {
+                  notify.err(errText(e));
                 }
-              />
-            )}
-          </>
-        }
-      />
+              }}
+              trigger={
+                <Button variant="outline" size="sm" className="rounded-full">
+                  <Wrench className="h-3.5 w-3.5" />
+                  {t('stats.repairButton')}
+                </Button>
+              }
+            />
+          )}
+          {isAdmin && (
+            <ConfirmDialog
+              title={t('stats.rebuildTitle')}
+              description={t('stats.rebuildDesc')}
+              confirmText={t('stats.rebuildStart')}
+              destructive
+              onConfirm={async () => {
+                try {
+                  const r = await statsApi.rebuildUsage();
+                  const d = r.tokens_delta;
+                  notify.ok(
+                    t('stats.rebuilt'),
+                    t('stats.rebuiltDetail', {
+                      before: fmtNumber(r.rows_before),
+                      after: fmtNumber(r.rows_after),
+                    }) +
+                      (d !== 0
+                        ? t('stats.rebuiltDetailTokens', {
+                            delta: `${d > 0 ? '+' : ''}${fmtNumber(d)}`,
+                          })
+                        : t('stats.rebuiltDetailSame')),
+                  );
+                  reload();
+                } catch (e) {
+                  notify.err(errText(e));
+                }
+              }}
+              trigger={
+                <Button variant="outline" size="sm" className="rounded-full text-amber-600 dark:text-amber-400">
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  {t('stats.rebuildButton')}
+                </Button>
+              }
+            />
+          )}
+        </>
+      }
+    />
+  );
+
+  /**
+   * 首屏还没拿到统计：整块数据区换成骨架。
+   *
+   * 为什么整块换而不是各块单独兜：四张卡片与两张分解表都是「数字 / 表格」，
+   * 数据没到时会渲染成 0 和「暂无数据」——看起来像「今天一次都没用」，
+   * 其实只是还没取到。这和本批其它页修的是同一件事：**界面别在说谎**。
+   */
+  if (isInitialFailed || isInitialLoading) {
+    return (
+      <div className="flex flex-col gap-4 md:gap-6">
+        {header}
+        {isInitialFailed ? (
+          <LoadError variant="page" onRetry={retry} />
+        ) : (
+          <StatsSkeleton />
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-4 md:gap-6" aria-busy={isRefreshing}>
+      {header}
+
+      {/* 部分失败：已经显示出来的数字仍然是对的，只是可能不是最新的。
+          用一条常驻提示说明，**不把内容顶掉**；下一次刷新成功后自动消失。 */}
+      {failedCount > 0 && <LoadError message={t('state.partialFailed')} onRetry={retry} />}
 
       {/* 统计没在累计时明确提示。
           统计是旁路写入（失败不影响转发），所以坏了以后界面看不出异常——
@@ -303,11 +402,10 @@ export default function StatsPage() {
       <section className="rounded-[20px] bg-muted p-4">
         <div className="mb-3 flex items-center justify-between">
           <div className="text-sm font-medium">{t('stats.tokenTrend')}</div>
-          {/* 窗口只有一天时「按天聚合」是废话（就一根柱子），换成「当日汇总」；
-              多天窗口保持原文案。两者都随选择器走，不会出现「选择器是今日、
-              副标题还写着按天聚合」的错配。 */}
+          {/* 副标题必须与**实际粒度**一致：今日是按小时画的，写「按天聚合」就是
+              在骗人（这也是最早那版的表现：选择器说今日、图是一根柱子）。 */}
           <div className="text-[11px] text-muted-foreground">
-            {days === '1' ? t('stats.dailyAggToday') : t('stats.dailyAgg')}
+            {spec.granularity === 'hour' ? t('stats.hourlyAgg') : t('stats.dailyAgg')}
           </div>
         </div>
         <div className="h-[260px] w-full">
@@ -317,7 +415,15 @@ export default function StatsPage() {
                   失败曲线（Line）根本不会被渲染 —— 实测踩过，图上一条线都没有。 */}
               <ComposedChart data={chartData} margin={{top: 4, right: 8, bottom: 0, left: -8}} barCategoryGap="20%">
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-                <XAxis dataKey="day" tickLine={false} axisLine={false} fontSize={11} stroke="var(--muted-foreground)" />
+                <XAxis
+                  dataKey="label"
+                  tickLine={false}
+                  axisLine={false}
+                  fontSize={11}
+                  stroke="var(--muted-foreground)"
+                  /* 24 个小时（或 90 天）标签全画出来会糊成一片，按 spec 抽稀。 */
+                  interval={Math.max(0, spec.tickEvery - 1)}
+                />
                 <YAxis tickLine={false} axisLine={false} fontSize={11} stroke="var(--muted-foreground)" tickFormatter={(v) => fmtCompact(Number(v))} />
                 <Tooltip
                   cursor={{fill: 'var(--accent)'}}
@@ -336,14 +442,37 @@ export default function StatsPage() {
                     return [fmtNumber(Number(value)), t('metric.requests')];
                   }}
                 />
-                <Bar
-                  dataKey="tokens"
-                  name="tokens"
-                  fill="var(--chart-1)"
-                  radius={[4, 4, 0, 0]}
-                  /* 限制柱宽：只有一两天数据时，柱子不会被拉伸占满整个图表 */
-                  maxBarSize={48}
-                />
+                {spec.shape === 'bar' ? (
+                  <Bar
+                    dataKey="tokens"
+                    name="tokens"
+                    fill="var(--chart-1)"
+                    radius={[4, 4, 0, 0]}
+                    /* 限制柱宽：只有一两天数据时，柱子不会被拉伸占满整个图表 */
+                    maxBarSize={48}
+                  >
+                    {/* 当前小时单独上色：一眼看出「现在走到哪一格」，
+                        右边的空档也就自然读成「今天还没到那些时候」。 */}
+                    {chartData.map((p) => (
+                      <Cell
+                        key={p.full}
+                        fill={p.isNow ? 'var(--chart-2)' : 'var(--chart-1)'}
+                      />
+                    ))}
+                  </Bar>
+                ) : (
+                  /* 30 / 90 天用面积：柱子细得看不清起伏，而面积图的形状对
+                     「总量趋势」更直观（尖峰一眼可见）。 */
+                  <Area
+                    type="monotone"
+                    dataKey="tokens"
+                    name="tokens"
+                    stroke="var(--chart-1)"
+                    fill="var(--chart-1)"
+                    fillOpacity={0.18}
+                    strokeWidth={2}
+                  />
+                )}
                 {/* 失败数用一条线叠在同一张图上：它与 token 柱不同量级，做成柱子
                     会把柱形压扁。线只作「那天出过事」的信号，具体数值看悬停。
                     没有失败时贴着 0，不干扰读数。 */}
@@ -520,5 +649,71 @@ function BreakdownPanel({
         />
       )}
     </div>
+  );
+}
+
+/**
+ * 首屏骨架。
+ *
+ * 逐块对着真实版面：四张统计卡（同高 88/96px）、趋势图（同高 260px）、两张分解表、
+ * 上游面板。尺寸必须对齐——骨架比真实内容矮的话，数据到位时整页会往下窜一下，
+ * 比没有骨架更难受。
+ */
+function StatsSkeleton() {
+  return (
+    <>
+      <section className="grid grid-cols-2 gap-3 lg:grid-cols-4 md:gap-4">
+        {Array.from({length: 4}, (_, i) => (
+          <div
+            key={i}
+            className="min-h-[88px] rounded-[20px] bg-muted px-3.5 py-3 sm:min-h-[96px] sm:px-4"
+          >
+            <div className="flex items-start justify-between gap-2">
+              <SkeletonBar className="h-2.5 w-16" />
+              <SkeletonBar className="h-6 w-6 rounded-full" />
+            </div>
+            <SkeletonBar className="mt-3 h-6 w-20" />
+            <SkeletonBar className="mt-2 h-2.5 w-24" />
+          </div>
+        ))}
+      </section>
+
+      <section className="rounded-[20px] bg-muted p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <SkeletonBar className="h-3.5 w-24" />
+          <SkeletonBar className="h-3 w-20" />
+        </div>
+        <SkeletonBar className="h-[260px] w-full rounded-2xl" />
+      </section>
+
+      <section className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        {Array.from({length: 2}, (_, i) => (
+          <div key={i} className="rounded-[20px] bg-muted p-4">
+            <div className="mb-3 flex items-center gap-2">
+              <SkeletonBar className="h-4 w-4 rounded-full" />
+              <SkeletonBar className="h-3.5 w-20" />
+            </div>
+            {Array.from({length: 4}, (_, r) => (
+              <div key={r} className="flex items-center justify-between py-2.5">
+                <SkeletonBar className="h-3 w-28" />
+                <SkeletonBar className="h-3 w-12" />
+              </div>
+            ))}
+          </div>
+        ))}
+      </section>
+
+      <section className="rounded-[20px] bg-muted p-4">
+        <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <SkeletonBar className="h-3.5 w-24" />
+          <SkeletonBar className="h-3 w-40" />
+        </div>
+        <div className="flex flex-wrap gap-x-6 gap-y-2">
+          {Array.from({length: 5}, (_, i) => (
+            <SkeletonBar key={i} className="h-3 w-20" />
+          ))}
+        </div>
+      </section>
+    </>
   );
 }

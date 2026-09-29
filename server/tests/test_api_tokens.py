@@ -268,6 +268,7 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
     # 服务级 / 不可逆 / 能提权或抹痕迹的动作，只对**会话**开放。
     SESSION_ONLY = {
         'DELETE /api/accounts/{filename}',
+        'DELETE /api/system/update-status',   # 清除更新结果与日志：属于「抹掉痕迹」类
         'DELETE /api/security/rules/{rule_id}',
         'DELETE /api/tokens/{token_id}',
         'DELETE /api/users/{username}',
@@ -287,6 +288,14 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'POST /api/task-logs/clear',
         'POST /api/tokens',
         'POST /api/users',
+        # 多上游（账号池分组）：这几条带着上游的 api_key，而且能改「谁的流量走哪个池」——
+        # 与 /api/settings/upstream 同级（改配置级凭据 + 影响全部账号行为），只对会话开放。
+        'DELETE /api/upstreams/{upstream_id}',
+        'PATCH /api/upstreams/{upstream_id}',
+        'POST /api/upstreams',
+        # 账号分组互转：把账号文件在分组的目录之间移动——等于改「这个号属于哪个
+        # 池」，与删账号同级（都会改变池的构成），只对会话开放。
+        'POST /api/accounts/{filename}/move',
     }
     # 写方法但只要求「已登录」——只读令牌也能调。必须逐个有理由。
     ANY_LOGGED_IN = {

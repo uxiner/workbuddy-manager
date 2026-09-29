@@ -351,7 +351,8 @@ class RouteIntegrationTest(unittest.TestCase):
             return _Client(resp, calls)
 
         with mock.patch.object(config, 'http_client', fake_client), \
-             mock.patch.object(acct_router.reload, 'request_restart', lambda: True):
+             mock.patch.object(acct_router.reload, 'request_restart',
+                               lambda upstream=None: True):
             out = asyncio.run(acct_router.account_set_disabled(
                 self.fname, {'disabled': disabled}, {'username': 'admin'}))
         return out, calls
@@ -485,7 +486,8 @@ class AdminSectionEditableTest(unittest.TestCase):
         文案必须讲清「开与不开分别会怎样」——用户在账号页点停用时看到的提示
         会随这个开关变化，不说清楚会以为是 bug。
         """
-        src = (ROOT / 'web/app/(main)/settings/page.tsx').read_text(encoding='utf-8')
+        # 设置页的字段定义在外壳里（批次 4 起 Tab 变成子路由，见 layout.tsx 顶部）
+        src = (ROOT / 'web/app/(main)/settings/layout.tsx').read_text(encoding='utf-8')
         self.assertIn('ADMIN_FIELDS', src)
         self.assertIn("id: 'admin'", src)
         seg = src[src.index('const ADMIN_FIELDS'):]

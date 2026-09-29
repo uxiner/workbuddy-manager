@@ -101,7 +101,12 @@ def _download_hint(exc: BaseException) -> str:
         return '（当前使用的是环境变量里的代理；若代理不可用，可用 WB_UPDATE_PROXY 指定一个）'
     return ('（当前网络似乎无法直连 GitHub。容器/内网环境请在 .env 里设置 '
             'WB_UPDATE_PROXY=http://<宿主IP>:<端口> 后重试，例如 http://172.17.0.1:7890）')
-UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/Sliverkiss/workbuddy2api.git'
+UPSTREAM_REPO = os.environ.get('WB_UPSTREAM_REPO') or 'https://github.com/uxiner/workbuddy2api-panel.git'
+# External-image deployments manage workbuddy2api separately. In that mode
+# manager updates must not copy bundled source into the production bind mount
+# or rebuild the upstream container. Existing source-style deployments keep
+# the historical bundled behavior by default.
+UPSTREAM_MODE = (os.environ.get('WB_UPSTREAM_MODE') or 'bundled').strip().lower()
 SERVICE_NAME = os.environ.get('WB_SERVICE_NAME') or 'workbuddy-web'
 DATA_DIR = Path(os.environ.get('WB_DATA_DIR') or INSTALL_DIR / 'data')
 STATUS_FILE = Path(os.environ.get('WB_UPDATE_STATUS') or DATA_DIR / 'update-status.json')
@@ -1192,8 +1197,11 @@ def update_manager(rep: Reporter) -> None:
         # 由此落在签名信任链内；另下一份则没有这层保证。
         # 只有真的改动了才重建容器——上游源码在两版之间多数没变，白重建一次要等
         # 好几分钟，还会把上游短暂停掉。
-        changed = _sync_bundled_upstream(new_root / 'upstream', rep)
-        if changed:
+        if UPSTREAM_MODE in ('external', 'off', 'disabled', 'none'):
+            rep.log('已配置 WB_UPSTREAM_MODE=external：跳过内置 upstream 同步与重建')
+        else:
+            changed = _sync_bundled_upstream(new_root / 'upstream', rep)
+        if UPSTREAM_MODE not in ('external', 'off', 'disabled', 'none') and changed:
             # 包内那份 compose 是**上游原样**（`7863:7863`，公网可达），而端口收敛
             # 是在 update_upstream 里做的——那一步在本函数之前。同步会把它盖掉，
             # 所以这里必须**重新施加**安全基线，否则上游会重新暴露到 0.0.0.0。

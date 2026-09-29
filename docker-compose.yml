@@ -66,6 +66,10 @@ services:
       #   - 同网络（推荐）：http://workbuddy2api:7863
       #   - 用宿主机 Docker 网关：http://host.docker.internal:7863
       WB2API_BASE: http://host.docker.internal:7863
+      # workbuddy2api is an independently managed fork image; do not let
+      # manager updates copy bundled source into its bind mount.
+      WB_UPSTREAM_MODE: external
+      WB_UPSTREAM_REPO: https://github.com/uxiner/workbuddy2api-panel.git
       # 可选：子路径部署前缀，必须与上面 build.args.BASE_PATH 完全一致（留空则都不填）。
       # 服务端用它补回响应里漏掉的站内地址，并在反代保留前缀时把前缀剥掉。
       # 详见 deploy/README.md 的「子路径部署」。

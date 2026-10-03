@@ -17,6 +17,7 @@ import {
   PlugZap,
   Loader2,
   DownloadCloud,
+  Database,
   FileText,
   KeyRound,
 } from 'lucide-react';
@@ -48,6 +49,7 @@ import {ConfirmDialog} from '@/components/common/layout/ConfirmDialog';
 import {ResetPasswordDialog} from '@/components/common/settings/ResetPasswordDialog';
 import {useAuth} from '@/lib/auth-context';
 import {UpdatePanel} from '@/components/common/settings/UpdatePanel';
+import {PgSyncPanel} from '@/components/common/settings/PgSyncPanel';
 import {TokensPanel} from '@/components/common/settings/TokensPanel';
 import {ChangelogPanel} from '@/components/common/settings/ChangelogPanel';
 import {UpstreamReloadNotice} from '@/components/common/settings/UpstreamReloadNotice';
@@ -162,8 +164,8 @@ type Field =
   | SelectField
   | TextField;
 
-/** 时长格式校验：数字 + 单位（s/m/h/d） */
-const DURATION_RE = /^\d+\s*(s|m|h|d)$/i;
+/** 时长格式校验：数字 + 单位（s/m/h，不含 d —— Go time.ParseDuration 不认 d） */
+const DURATION_RE = /^\d+\s*(s|m|h)$/i;
 
 /**
  * 一个时长字段的取值是否合法。
@@ -856,6 +858,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
     users: {icon: <Users className="h-3.5 w-3.5" />},
     tokens: {icon: <KeyRound className="h-3.5 w-3.5" />},
     system: {icon: <DownloadCloud className="h-3.5 w-3.5" />},
+    backup: {icon: <Database className="h-3.5 w-3.5" />},
     changelog: {icon: <FileText className="h-3.5 w-3.5" />},
     about: {icon: <Info className="h-3.5 w-3.5" />},
   };
@@ -2062,6 +2065,11 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
         {/* ═══ 系统更新 ═══ */}
         <TabsContent value="system" className="mt-4 space-y-4">
           <UpdatePanel />
+        </TabsContent>
+
+        {/* ═══ 数据备份 ═══ */}
+        <TabsContent value="backup" className="mt-4 space-y-4">
+          <PgSyncPanel />
         </TabsContent>
 
         {/* ═══ 更新日志 ═══ */}

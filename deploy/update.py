@@ -32,6 +32,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -58,6 +59,53 @@ UPSTREAM_DIR = Path(os.environ.get('WB_UPSTREAM_DIR') or '/opt/workbuddy2api')
 UPSTREAM_PORT = int(os.environ.get('WB_UPSTREAM_PORT') or 7863)
 MANAGER_PORT = int(os.environ.get('WB_MANAGER_PORT') or 7864)
 MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
+
+
+def upstream_health_url() -> str:
+    """就绪探测用的上游健康检查地址（按部署形态取，不写死回环）。
+
+    容器部署下 manager 与上游是两个容器：宿主把上游端口发布在 127.0.0.1 上，那是
+    **宿主机**的回环，manager 容器里没有这个端口——写死回环会让探测整整 90 轮
+    connection refused、空等约 3 分钟，最后打一条「未在预期时间内就绪」的假警告
+    （上游其实早就起来了）。取值顺序：
+
+      ① `WB_UPSTREAM_HEALTH_URL` —— 整条 URL 显式指定（反代 / 子路径场景）；
+      ② `WB2API_BASE` 的 scheme+host —— 面板自己就是用这个地址访问上游的，
+         容器部署下它是容器 DNS（如 http://workbuddy2api:7863）；
+      ③ 回落 `http://127.0.0.1:{WB_UPSTREAM_PORT}/healthz` —— 宿主机原生部署。
+
+    后两条与面板 server/config.py 同源：探测地址跟着**面板实际怎么连上游**走，
+    两边不会再各说各话。
+    """
+    explicit = (os.environ.get('WB_UPSTREAM_HEALTH_URL') or '').strip()
+    if explicit:
+        return explicit
+    base = (os.environ.get('WB2API_BASE') or '').strip()
+    if base:
+        try:
+            parts = urllib.parse.urlsplit(base if '//' in base else f'http://{base}')
+            host = parts.hostname or ''
+            port = parts.port  # 端口非法时在这里抛 ValueError
+            if parts.scheme and host:
+                netloc = f'[{host}]' if ':' in host else host  # IPv6 字面量要带方括号
+                if port:
+                    netloc = f'{netloc}:{port}'
+                return f'{parts.scheme}://{netloc}/healthz'
+        except ValueError:
+            pass  # 畸形值不致命：更新流程不该因为一个地址拼不出来就中断
+    return f'http://127.0.0.1:{UPSTREAM_PORT}/healthz'
+
+
+def _probe_opener() -> urllib.request.OpenerDirector:
+    """健康探测**直连**，不走代理。
+
+    探测问的是「上游进程起来没有」。容器部署里 `WB_HTTP_PROXY` / `WB_UPDATE_PROXY`
+    往往是为拉 GitHub 配的（issue #106），而上游在容器内网——把内部地址交给代理
+    只会必失败，又变成一条假警告（与写死回环同一类错）。确需经代理才能连上上游的
+    部署，可用 `WB_UPSTREAM_HEALTH_URL` 指一个可达地址。
+    """
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 # ── 下载代理（issue #106）──────────────────────────────────────
 # 容器里能连上 api.github.com（版本检测走它）却连不上 Release 资产所在的
@@ -319,8 +367,9 @@ def check_signature(archive: Path, sig_path: Path, rep: Reporter) -> None:
 
     if not sig_path.is_file():
         raise RuntimeError(
-            '该 Release 没有可用的签名文件，已拒绝安装。\n'
-            '  正常发布流程会附带 .tar.gz.sig；缺失说明发布流程可能被改动。'
+            '该 Release 尚未附带签名文件，已拒绝安装。\n'
+            '  新版本发布后需要维护者在自己的机器上签名再上传（一般几分钟到几十分钟）；'
+            '稍后重试即可，不需要改任何配置。'
         )
 
     # ssh-keygen 要求 allowed_signers 格式（纯 .pub 文件不接受）
@@ -363,21 +412,48 @@ def check_signature(archive: Path, sig_path: Path, rep: Reporter) -> None:
 
 
 def download_signature(sig_url: str, archive: Path, rep: Reporter) -> Path:
-    """下载签名文件到包旁边，返回其路径。失败时抛错（不返回"空签名"）。"""
+    """下载签名文件到包旁边，返回其路径。失败时抛错（不返回"空签名"）。
+
+    两种失败要分开说（用户报过 #127/#129）：把**网络超时**说成「该 Release 没有
+    可用的签名文件」，会把人引到「发布流程是不是被改坏了」上去，而真正该做的是
+    稍后重试。所以：
+
+      · 404 → Release 里确实没有 `.sig`（维护者签名前的窗口期就是这种）→ 明说
+        「尚未附带签名文件，稍后重试」，不要暗示发布流程被改动；
+      · 其它（超时/连接失败）→ 明说「下载失败（网络问题）」并**重试三次**——
+        GitHub 资产 CDN 偶发超时很常见（维护者本机也遇到过整包下到一半卡住）。
+    """
     sig_path = archive.with_suffix(archive.suffix + '.sig')
     if not sig_url:
         return sig_path  # 让 check_signature 报「缺少签名文件」并给出清晰指引
     rep.log('下载签名文件…')
-    try:
-        req = urllib.request.Request(sig_url, headers={'User-Agent': 'workbuddy-manager-updater'})
-        with _opener().open(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
-            shutil.copyfileobj(resp, fh)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            f'该 Release 没有可用的签名文件，已拒绝安装：{exc}\n'
-            '  正常发布流程会附带 .tar.gz.sig；缺失说明发布流程可能被改动。'
-        ) from exc
-    return sig_path
+    last: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            req = urllib.request.Request(sig_url,
+                                         headers={'User-Agent': 'workbuddy-manager-updater'})
+            with _opener().open(req, timeout=60) as resp, open(sig_path, 'wb') as fh:
+                shutil.copyfileobj(resp, fh)
+            return sig_path
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                sig_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    '该 Release 尚未附带签名文件，已拒绝安装。\n'
+                    '  新版本发布后需要维护者在自己的机器上签名再上传（一般几分钟到几十分钟）；'
+                    '稍后重试即可，不需要改任何配置。'
+                ) from exc
+            last = exc
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+        sig_path.unlink(missing_ok=True)      # 半截文件不能留给后面的验签
+        if attempt < 3:
+            rep.log(f'签名文件下载失败（{last}），第 {attempt}/3 次，稍后重试…', 'warn')
+            time.sleep(3 * attempt)
+    raise RuntimeError(
+        f'下载签名文件失败（网络问题，不是发布流程的问题）：{last}\n'
+        '  已重试 3 次。稍后再试；若一直失败，请检查这台服务器到 GitHub 的网络或代理设置。'
+    ) from last
 
 
 def verify_release_signature(archive: Path, sig_url: str, rep: Reporter) -> None:
@@ -720,12 +796,8 @@ def rebuild_upstream(rep: Reporter) -> None:
         _report_service_state(rep)
         raise RuntimeError('上游重建失败' + (f'：{hint}' if hint else '，请查看上方日志'))
 
-    # 6) 等待就绪
-    rep.log('等待上游就绪…')
-    if wait_health(f'http://127.0.0.1:{UPSTREAM_PORT}/healthz', 90, rep):
-        rep.log('上游已就绪')
-    else:
-        rep.log('上游未在预期时间内就绪，请查看容器日志', 'warn')
+    # 6) 等待就绪（地址按部署形态取：容器里不是回环，见 upstream_health_url）
+    wait_upstream_ready(rep)
 
 
 def _clear_version_cache(rep: Reporter) -> None:
@@ -923,7 +995,7 @@ def _diagnose_build_failure(out: str) -> str:
 
 def _health_ok(url: str, timeout: int = 3) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with _probe_opener().open(url, timeout=timeout) as resp:
             return resp.status == 200
     except Exception:  # noqa: BLE001
         return False
@@ -935,7 +1007,7 @@ def _report_service_state(rep: Reporter) -> None:
     构建失败时 compose 不会动已在运行的容器，因此旧版本通常仍在提供服务；
     明确告诉用户这一点，避免误以为「更新失败=服务挂了」而做多余操作。
     """
-    if _health_ok(f'http://127.0.0.1:{UPSTREAM_PORT}/healthz'):
+    if _health_ok(upstream_health_url()):
         rep.log('注意：本次重建失败，但检测到上游仍在响应——旧容器未被影响，服务正常', 'warn')
     else:
         rep.log('警告：上游健康检查未通过，请检查容器状态（docker ps / docker logs）', 'error')
@@ -1033,12 +1105,26 @@ def _compose_cmd(rep: Reporter | None = None) -> list[str] | None:
 def wait_health(url: str, tries: int, rep: Reporter) -> bool:
     for _ in range(tries):
         try:
-            with urllib.request.urlopen(url, timeout=3) as resp:
+            with _probe_opener().open(url, timeout=3) as resp:
                 if resp.status == 200:
                     return True
         except Exception:  # noqa: BLE001
             pass
         time.sleep(2)
+    return False
+
+
+def wait_upstream_ready(rep: Reporter) -> bool:
+    """重建后等上游就绪。
+
+    地址走 `upstream_health_url()`（按部署形态取），不要在这里写死回环——
+    容器部署下那句「未在预期时间内就绪」会变成一条与事实相反的假警告。
+    """
+    rep.log('等待上游就绪…')
+    if wait_health(upstream_health_url(), 90, rep):
+        rep.log('上游已就绪')
+        return True
+    rep.log('上游未在预期时间内就绪，请查看容器日志', 'warn')
     return False
 
 

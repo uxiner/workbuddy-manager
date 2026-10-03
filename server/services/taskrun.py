@@ -47,6 +47,8 @@ import time
 from pathlib import Path
 
 from .. import config, db
+from .errtext import err_text
+
 
 logger = logging.getLogger('workbuddy.taskrun')
 
@@ -216,7 +218,7 @@ def extract_scripts(rep: logging.Logger | None = None) -> tuple[bool, str]:
     except FileNotFoundError:
         return _fail('未找到 docker 命令，无法从上游容器提取脚本')
     except Exception as exc:  # noqa: BLE001
-        return _fail(f'从上游容器提取脚本失败：{exc}')
+        return _fail(f'从上游容器提取脚本失败：{err_text(exc)}')
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or '').strip()
@@ -409,6 +411,7 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
     # 显式指定账号目录：脚本自身的回落顺序（WB2A_AUTHS > 仓库内 auths/ >
     # /root/...）不一定指向本面板管的那批文件，传错会「跑了个寂寞」还看不出来。
     env['WB2A_AUTHS'] = str(config.AUTH_DIR)
+    env['WB2A_PROXY_CONFIG'] = str(config.UPSTREAM_CONFIG)
     # 与 argv 里的 `-u` 双保险：两者都是「不缓冲」的表达，任一被忽略时另一个兜住
     # （脚本将来若自己拉起子进程，环境变量也能继承下去）。
     env['PYTHONUNBUFFERED'] = '1'
@@ -465,7 +468,7 @@ async def _run(argv: list[str], mode: str, target: str) -> None:
         code = await proc.wait()
         _state['exit_code'] = code
     except FileNotFoundError as exc:
-        _state['error'] = f'无法启动脚本：{exc}'
+        _state['error'] = f'无法启动脚本：{err_text(exc)}'
         logger.warning('任务脚本启动失败: %s', exc)
     except Exception as exc:  # noqa: BLE001
         _state['error'] = str(exc)[:300]

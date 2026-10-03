@@ -113,6 +113,7 @@ export default function AccountsPage() {
   const t = useT();
   const {isAdmin} = useAuth();
   const [addOpen, setAddOpen] = useState(false);
+  const [proxyRoutes, setProxyRoutes] = useState<string[] | null>(null);
   // 备注编辑（issue #67）：记的是**哪个账号**而不是布尔——弹窗要以该账号当前的
   // 备注为初值，否则会拿上一个账号的内容去保存。
   const [noteTarget, setNoteTarget] = useState<Account | null>(null);
@@ -790,6 +791,50 @@ export default function AccountsPage() {
   }
 
   /** Token 有效期进度条 */
+  useEffect(() => {
+    let active = true;
+    accountApi.proxies().then((data) => {
+      if (active) setProxyRoutes(data.routes);
+    }).catch((error) => { if (active) notify.err(errText(error)); });
+    return () => { active = false; };
+  }, []);
+
+  /**
+   * 要不要显示「线路」这一列。
+   *
+   * 线路表读自**上游配置**的 `proxies`：没配过时那个下拉里只有「直连」一项 —— 对绝大
+   * 多数部署那只是一列噪声，还会让人以为能选却选不动（维护者复核补）。所以两种情况
+   * 才显示：有线路可选，或者确实有账号绑着线路（配置被移除后仍要看得见、改得回来）。
+   */
+  const hasProxyUi = (proxyRoutes ?? []).length > 0
+    || (accounts ?? []).some((a) => a.proxy);   // accounts 可能还没取到
+
+  function renderProxy(a: Account) {
+    if (!isAdmin) return <span className="text-xs">{a.proxy || t('accounts.proxyDirect')}</span>;
+    return (
+      <Select value={a.proxy ? `route:${a.proxy}` : 'default'} disabled={proxyRoutes === null || busyFile === a.file}
+              onValueChange={async (value) => {
+                setBusyFile(a.file);
+                try {
+                  await accountApi.setProxy(a.file, value === 'default' ? '' : value.slice(6), groupId);
+                  notify.ok(t('accounts.proxySaved'));
+                  await reloadAll();
+                } catch (error) { notify.err(errText(error)); }
+                finally { setBusyFile(null); }
+              }}>
+        <SelectTrigger className="h-8 min-w-[100px] max-w-[155px] text-xs" aria-label={t('accounts.proxyLine')}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="default">{t('accounts.proxyDirect')}</SelectItem>
+          {a.proxy && !(proxyRoutes ?? []).includes(a.proxy) &&
+            <SelectItem value={`route:${a.proxy}`}>{a.proxy} ({t('accounts.proxyMissing')})</SelectItem>}
+          {(proxyRoutes ?? []).map((route) => <SelectItem key={route} value={`route:${route}`}>{route}</SelectItem>)}
+        </SelectContent>
+      </Select>
+    );
+  }
+
   function renderExpiry(a: Account) {
     const pct = expiryBarPercent(a.remain_seconds, a.ttl_seconds);
     const vis = expiryVisual(a.remain_seconds);
@@ -836,7 +881,17 @@ export default function AccountsPage() {
     // 测试 / 刷新 Token 这些操作仍然可用、也必须仍然可见——否则用户会以为
     // 「停用把签到也停了」，正好把这条路与改名那条的区别抹掉了。
     const viaBit = a.manual_disabled === true;
+    // 上游**系统自动禁用**（12153 连败 / 11140 被封）：也不在选号池里
+    // （`healthy()` 直接 false），但 `manual_disabled` 是 false。
+    const autoDisabled = a.disabled === true;
+    // `off` = **完全退出账号池**：隐藏签到 / 测试 / 刷新这些操作（对这个号已无意义）。
+    // 注意自动禁用**不算**——它的账号文件仍被上游加载、凭证仍然有效，测试/刷新
+    // 恰恰是排查它为什么坏的手段（用户就是靠「连通性测试通过」确认凭证没问题的）。
     const off = paused || viaBit;
+    // 「停用 / 启用」开关显示哪一面：三种「不在池里」都算。此前漏了自动禁用，
+    // 于是被禁用的号按钮显示成「停用」，点一下反而给**已被禁用**的号再加一层
+    // manual_disabled（越弄越糟），而真正需要的「启用」根本没有入口。
+    const stopped = paused || viaBit || autoDisabled;
     const hasClearableState = a.cooling === true || rateLimitedModels(a).length > 0;
     return (
       <div className="flex justify-end gap-1">
@@ -955,23 +1010,28 @@ export default function AccountsPage() {
           size="icon"
           className={
             'h-7 w-7 rounded-md ' +
-            (off ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
+            (stopped ? 'text-emerald-600 hover:text-emerald-600' : 'text-amber-600 hover:text-amber-600')
           }
-          title={off ? t('accounts.enableTitle') : t('accounts.disableTitle')}
+          title={stopped ? t('accounts.enableTitle') : t('accounts.disableTitle')}
           disabled={busy}
           onClick={() => run(
             a.file,
-            () => accountApi.setDisabled(a.file, !off, groupId),
+            // 传 `stopped` 的反面：自动禁用的号点这里会走「启用」，后端在启用路径上
+            // 会一并解除系统禁用位（调上游的 revive）——这正是它此前缺的入口。
+            () => accountApi.setDisabled(a.file, !stopped, groupId),
             // 文案如实反映用的是哪种机制：状态位停用后任务照常，改名停用则全停。
-            off ? t('accounts.enabled')
-                : (viaBit ? t('accounts.manualDisabled') : t('accounts.disabled')),
+            stopped ? t('accounts.enabled')
+                    : (viaBit ? t('accounts.manualDisabled') : t('accounts.disabled')),
           )}
         >
-          {off ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
+          {stopped ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
         </Button>
+        {/* 账号名放说明里而不是标题：名称可能很长，18px 标题在 380px 弹窗里一折行就挤乱。
+            窄屏用 min() 保住两侧 1rem 留白，单写 380px 会在 <412px 的手机上贴满屏幕边缘。 */}
         <ConfirmDialog
-          title={t('accounts.deleteTitle', {name: a.nickname || a.uid})}
-          description={t('accounts.deleteDesc')}
+          title={t('accounts.deleteTitle')}
+          description={t('accounts.deleteDesc', {name: a.nickname || a.uid})}
+          contentClassName="max-w-[min(380px,calc(100%-2rem))] sm:max-w-[380px]"
           confirmText={t('accounts.delete')}
           destructive
           onConfirm={() => run(a.file, () => accountApi.remove(a.file, groupId),
@@ -1280,6 +1340,9 @@ export default function AccountsPage() {
                 {renderExpiry(a)}
               </div>
 
+              {hasProxyUi && (
+                <div className="flex items-center gap-2 text-xs"><span className="text-muted-foreground">{t('accounts.proxyLine')}</span>{renderProxy(a)}</div>
+              )}
               {isAdmin && renderActions(a)}
             </div>
           ))}
@@ -1295,6 +1358,7 @@ export default function AccountsPage() {
               <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('metric.credits')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colExpiry')}</TableHead>
+              {hasProxyUi && <TableHead className="text-[11px] text-muted-foreground">{t('accounts.proxyLine')}</TableHead>}
               {isAdmin && <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">{t('accounts.colActions')}</TableHead>}
             </TableRow>
           </TableHeader>
@@ -1336,6 +1400,7 @@ export default function AccountsPage() {
                 </TableCell>
                 <TableCell>{renderCredits(a)}</TableCell>
                 <TableCell>{renderExpiry(a)}</TableCell>
+                {hasProxyUi && <TableCell>{renderProxy(a)}</TableCell>}
                 {isAdmin && <TableCell className="pr-4">{renderActions(a)}</TableCell>}
               </TableRow>
             ))}

@@ -26,6 +26,10 @@ import type {
   ModelCatalog,
   ModelListResponse,
   Page,
+  PgSyncConfig,
+  PgSyncConfigResponse,
+  PgSyncStatus,
+  PgSyncTestResult,
   PlaygroundModels,
   RedPacket,
   RedPacketDetail,
@@ -139,6 +143,10 @@ const groupQs = (upstreamId?: number | null): string =>
   upstreamId == null ? '' : `?upstream_id=${encodeURIComponent(String(upstreamId))}`;
 
 export const accountApi = {
+  proxies: () => get<{routes: string[]; default: string}>('/api/proxies'),
+  setProxy: (filename: string, proxy: string, upstreamId?: number | null) =>
+    put<{ok: boolean; proxy: string; reload_triggered: boolean}>(
+      `/api/accounts/${encodeURIComponent(filename)}/proxy` + groupQs(upstreamId), {proxy}),
   /**
    * 某分组的账号列表。upstreamId 省略 / null = 默认分组。
    *
@@ -156,9 +164,9 @@ export const accountApi = {
    * （国际版新号聊天报 14017）。用户在弹窗里改地区会重新发码，所以这里带的
    * 总是当前这张码对应的地区。
    */
-  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string) =>
+  start: (realm: Realm = 'cn', upstreamId?: number | null, region?: string, proxy?: string) =>
     post<{state: string; authUrl: string; realm: Realm}>(
-      '/api/auth/start' + groupQs(upstreamId), {realm, region}),
+      '/api/auth/start' + groupQs(upstreamId), {realm, region, proxy}),
   /** 轮询扫码结果。region 仅国际版需要（新号必须先做地区注册） */
   poll: (state: string, realm?: Realm, region?: string, upstreamId?: number | null) =>
     get<{
@@ -585,4 +593,22 @@ export const systemApi = {
     del<{ok: boolean; message: string}>('/api/system/update-status'),
   /** 更新日志（解析仓库根目录 CHANGELOG.md，离线可用） */
   changelog: () => get<Changelog>('/api/system/changelog'),
+};
+
+/* ── PostgreSQL 异地备份（设置 → 数据备份）────────────── */
+export const pgSyncApi = {
+  config: () => get<PgSyncConfigResponse>('/api/settings/pg-sync'),
+  /** 保存连接配置；password 传掩码或空串表示沿用已保存的值 */
+  save: (body: Partial<PgSyncConfig>) =>
+    post<{config: PgSyncConfig}>('/api/settings/pg-sync', body),
+  /** 探测连通性。表单里刚填的值优先，没填的字段回落到已保存的配置 */
+  test: (body: Partial<PgSyncConfig>) =>
+    post<PgSyncTestResult>('/api/settings/pg-sync/test', body),
+  /** 把本地数据全量推到 PostgreSQL（只读本地，不会改动它） */
+  exportData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/export'),
+  /** 从 PostgreSQL 拉回数据。**会覆盖本地数据**，前端必须先二次确认 */
+  importData: () =>
+    post<{ok: boolean; message: string; status: PgSyncStatus}>('/api/settings/pg-sync/import'),
+  status: () => get<PgSyncStatus>('/api/settings/pg-sync/status'),
 };
